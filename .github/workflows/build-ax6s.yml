@@ -21,7 +21,9 @@ jobs:
   build:
     name: AX6S (mediatek/mt7622, aarch64)
     runs-on: ubuntu-22.04
-    timeout-minutes: 720
+    # GitHub 托管 runner 的 job 硬上限是 6 小时, 写 720 也会被强杀。
+    # 设 330 让 job 在被强杀前优雅结束, 缓存才有机会保存 (job 被取消时不保存)
+    timeout-minutes: 330
 
     steps:
       - name: 检出仓库
@@ -54,20 +56,32 @@ jobs:
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
 
-      - name: 恢复 ccache 缓存
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-ax6s-${{ env.REPO_BRANCH }}-${{ github.sha }}
-          restore-keys: |
-            ccache-ax6s-${{ env.REPO_BRANCH }}-
-
       - name: 拉取 ImmortalWrt 源码
         run: |
           git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
           cd openwrt
           echo "SRC_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
           echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      # 以下两个缓存必须放在 clone 之后:
+      # 1) 目录是 openwrt/.ccache, 缓存先恢复会凭空建出 openwrt/ 目录,
+      #    导致 git clone 报 "destination path already exists" 而失败
+      # 2) OpenWrt 在 rules.mk 里强制 export CCACHE_DIR=$(TOPDIR)/.ccache,
+      #    会覆盖环境变量, 所以只能缓存这个目录, ~/.ccache 永远用不上
+      # key 用 config 文件哈希而不是 commit sha: 改 README 之类不会让缓存失效
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-ax6s-${{ env.REPO_BRANCH }}-${{ hashFiles('ax6s-immortalwrt-25.12.config') }}
+          restore-keys: |
+            ccache-ax6s-${{ env.REPO_BRANCH }}-
+
+      - name: 恢复已下载的源码包
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-ax6s-${{ env.REPO_BRANCH }}
 
       - name: 更新并安装 feeds
         run: |
@@ -97,8 +111,11 @@ jobs:
       - name: 编译固件
         run: |
           cd openwrt
-          ccache -M 10G
-          export PATH="/usr/lib/ccache:$PATH"
+          # 与 rules.mk 里的 $(TOPDIR)/.ccache 保持一致
+          export CCACHE_DIR="$GITHUB_WORKSPACE/openwrt/.ccache"
+          ccache -M 5G
+          echo "== ccache 初始状态 (首跑为空属于正常) =="
+          ccache -s | head -6
           echo "== 开始编译 $(date) =="
           set -o pipefail
           make -j$(nproc) V=s 2>&1 | tee ../build.log
