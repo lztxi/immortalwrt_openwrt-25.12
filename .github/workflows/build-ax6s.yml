@@ -1,0 +1,136 @@
+name: Build ImmortalWrt for Redmi AX6S
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ax6s-immortalwrt-25.12.config'
+      - 'files/**'
+      - '.github/workflows/build-ax6s.yml'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-25.12
+  CONFIG_FILE: ax6s-immortalwrt-25.12.config
+  TARGET_DIR: mediatek/mt7622
+  DEVICE_NAME: xiaomi_redmi-router-ax6s
+  TZ: Asia/Shanghai
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    name: AX6S (mediatek/mt7622, aarch64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 720
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 清理预装软件释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: 安装编译依赖
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex \
+            g++ g++-multilib gawk gcc-multilib gettext git gnutls-dev gperf help2man \
+            intltool libelf-dev libglib2.0-dev libgmp-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev \
+            libz-dev lld llvm lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch \
+            pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            unzip upx-ucl wget xmlto xxd zlib1g-dev zstd
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ax6s-${{ env.REPO_BRANCH }}-${{ github.sha }}
+          restore-keys: |
+            ccache-ax6s-${{ env.REPO_BRANCH }}-
+
+      - name: 拉取 ImmortalWrt 源码
+        run: |
+          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          cd openwrt
+          echo "SRC_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 载入 config 与自定义文件
+        run: |
+          cd openwrt
+          cp "../$CONFIG_FILE" .config
+          if [ -d ../files ]; then cp -r ../files ./files; fi
+          make defconfig
+          ./scripts/diffconfig.sh > ../config-effective.diff
+          cat ../config-effective.diff
+
+      - name: 上传最终生效配置(便于核对)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax6s-effective-config
+          path: config-effective.diff
+          if-no-files-found: ignore
+
+      - name: 下载依赖源码
+        run: cd openwrt && make download -j8
+
+      - name: 编译固件
+        run: |
+          cd openwrt
+          ccache -M 10G
+          export PATH="/usr/lib/ccache:$PATH"
+          echo "== 开始编译 $(date) =="
+          set -o pipefail
+          make -j$(nproc) V=s 2>&1 | tee ../build.log
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "== 并行编译失败, 单线程重试 $(date) =="
+            make -j1 V=s 2>&1 | tee -a ../build.log
+          fi
+          ccache -s
+
+      - name: 整理产物
+        run: |
+          cd openwrt/bin/targets/$TARGET_DIR
+          echo "== 产物列表 =="
+          ls -lh
+          mkdir -p ../../../../dist
+          cp -f *"$DEVICE_NAME"*.itb  ../../../../dist/ 2>/dev/null || true
+          cp -f *"$DEVICE_NAME"*.bin  ../../../../dist/ 2>/dev/null || true
+          cp -f *"$DEVICE_NAME"*.manifest ../../../../dist/ 2>/dev/null || true
+          cp -f sha256sums ../../../../dist/ 2>/dev/null || true
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-${{ env.REPO_BRANCH }}-ax6s-${{ env.BUILD_DATE }}-${{ env.SRC_COMMIT }}
+          path: openwrt/dist/
+          if-no-files-found: error
+
+      - name: 失败时上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
