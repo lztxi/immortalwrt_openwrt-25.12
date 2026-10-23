@@ -16,6 +16,18 @@ env:
   DEVICE_NAME: xiaomi_redmi-router-ax6s
   TZ: Asia/Shanghai
   DEBIAN_FRONTEND: noninteractive
+  # 本 workflow 的文件名, 清理历史运行记录时用它把自己限定在本 workflow,
+  # 避免和 Nikki 版 workflow 互相删对方的运行记录和固件 Artifact
+  WF_FILE: build-ax6s.yml
+  # 编译完成后保留最近几次"成功"的运行记录, 失败/取消的不占名额
+  KEEP_SUCCESS: 3
+
+# 清理历史运行记录需要 actions: write
+# 若仓库默认是只读权限, 清理步骤会全部返回 403, 需要到
+# Settings -> Actions -> General -> Workflow permissions 勾选 Read and write
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   build:
@@ -151,3 +163,64 @@ jobs:
           name: build-log
           path: build.log
           if-no-files-found: ignore
+
+      # 清理历史运行记录: 失败/取消/超时一律删除且不占用保留名额, 成功只留最近 KEEP_SUCCESS 次
+      # 注意: 删除运行记录会连带删掉那次的日志和 Artifact(固件),
+      #       所以 KEEP_SUCCESS 实际上就是你能保留的固件份数
+      # 加了 workflow_id=$WF_FILE 限定: 只扫描本 workflow 的运行记录,
+      # 否则会和 build-ax6s-nikki.yml 互相删除对方的成品
+      - name: 清理历史运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          api="https://api.github.com/repos/$REPO/actions/runs"
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp"' EXIT
+
+          for p in 1 2 3 4 5; do
+            resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                        -H "Accept: application/vnd.github+json" \
+                        "$api?workflow_id=$WF_FILE&per_page=100&page=$p")
+            cnt=$(printf '%s' "$resp" | jq -r '.workflow_runs | length // 0')
+            [ "$cnt" -eq 0 ] && break
+            # API 默认按创建时间倒序返回
+            printf '%s' "$resp" \
+              | jq -r '.workflow_runs[] | "\(.id)\t\(.conclusion // "pending")\t\(.status)"' \
+              >> "$tmp"
+          done
+
+          echo "扫描到 $WF_FILE 运行记录: $(wc -l < "$tmp" | tr -d ' ') 条"
+
+          # 先锁定保留名单: 最近 N 条成功的
+          keep=$(awk -F'\t' '$2=="success"{print $1}' "$tmp" | head -n "$KEEP_SUCCESS")
+          echo "保留名单(最近 $KEEP_SUCCESS 次成功): ${keep:-无}"
+
+          deleted=0
+          failed=0
+          while IFS=$'\t' read -r id conclusion status; do
+            # 正在跑的不动 (本次运行自己也在这里被跳过)
+            if [ "$status" != "completed" ]; then continue; fi
+            if [ "$id" = "$GITHUB_RUN_ID" ]; then continue; fi
+            if [ "$conclusion" = "success" ] && printf '%s\n' "$keep" | grep -qx "$id"; then
+              continue
+            fi
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+                    -H "Authorization: Bearer $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "$api/$id")
+            if [ "$code" = "204" ]; then
+              echo "  已删除 $id ($conclusion)"
+              deleted=$((deleted + 1))
+            else
+              echo "  删除失败 $id ($conclusion) HTTP $code"
+              failed=$((failed + 1))
+            fi
+          done < "$tmp"
+
+          echo "清理完成: 删除 $deleted 条, 失败 $failed 条"
+          if [ "$failed" -gt 0 ] && [ "$deleted" -eq 0 ]; then
+            echo "::warning::一条都没删掉, 多半是 GITHUB_TOKEN 权限不足, 请把 Workflow permissions 改为 Read and write"
+          fi
