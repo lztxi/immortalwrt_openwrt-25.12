@@ -1,0 +1,247 @@
+name: Build ImmortalWrt for Redmi AX6S (Nikki)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ax6s-immortalwrt-25.12-nikki.config'
+      - 'files/**'
+      - '.github/workflows/build-ax6s-nikki.yml'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-25.12
+  CONFIG_FILE: ax6s-immortalwrt-25.12-nikki.config
+  TARGET_DIR: mediatek/mt7622
+  DEVICE_NAME: xiaomi_redmi-router-ax6s
+  TZ: Asia/Shanghai
+  DEBIAN_FRONTEND: noninteractive
+  # 本 workflow 的文件名, 清理历史运行记录时用它把自己限定在本 workflow,
+  # 避免和 OpenClash 版 workflow 互相删对方的运行记录和固件 Artifact
+  WF_FILE: build-ax6s-nikki.yml
+  # 编译完成后保留最近几次"成功"的运行记录, 失败/取消的不占名额
+  KEEP_SUCCESS: 3
+
+# 清理历史运行记录需要 actions: write
+# 若仓库默认是只读权限, 清理步骤会全部返回 403, 需要到
+# Settings -> Actions -> General -> Workflow permissions 勾选 Read and write
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: AX6S Nikki (mediatek/mt7622, aarch64)
+    runs-on: ubuntu-22.04
+    # GitHub 托管 runner 的 job 硬上限是 6 小时, 写 720 也会被强杀。
+    # 设 330 让 job 在被强杀前优雅结束, 缓存才有机会保存 (job 被取消时不保存)
+    # 这份配置比 OpenClash 版慢: mihomo 与 yq 都是 Go 项目, 要先拉 golang
+    # 工具链并编译 (含 gvisor tag), 首跑通常多出十几到几十分钟
+    timeout-minutes: 330
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 清理预装软件释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: 安装编译依赖
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex \
+            g++ g++-multilib gawk gcc-multilib gettext git gnutls-dev gperf help2man \
+            intltool libelf-dev libglib2.0-dev libgmp-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev \
+            libz-dev lld llvm lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch \
+            pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            unzip upx-ucl wget xmlto xxd zlib1g-dev zstd
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+
+      - name: 拉取 ImmortalWrt 源码
+        run: |
+          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          cd openwrt
+          echo "SRC_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      # Nikki 不在 immortalwrt 自带 feeds 里, 必须挂第三方源后才 update feeds。
+      # 该源提供三个包: nikki(主服务) / luci-app-nikki(界面) /
+      # mihomo-meta 与 mihomo-alpha(内核, 提供 PROVIDES:=mihomo 虚拟包)
+      - name: 追加 Nikki 软件源
+        run: |
+          cd openwrt
+          grep -q "src-git nikki" feeds.conf.default || \
+            echo "src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main" >> feeds.conf.default
+          echo "== feeds.conf.default =="
+          cat feeds.conf.default
+
+      # 以下两个缓存必须放在 clone 之后:
+      # 1) 目录是 openwrt/.ccache, 缓存先恢复会凭空建出 openwrt/ 目录,
+      #    导致 git clone 报 "destination path already exists" 而失败
+      # 2) OpenWrt 在 rules.mk 里强制 export CCACHE_DIR=$(TOPDIR)/.ccache,
+      #    会覆盖环境变量, 所以只能缓存这个目录, ~/.ccache 永远用不上
+      # key 必须在两版 workflow 之间区分: ccache 只缓存 C/C++, 两版配置
+      # 不同但会有大量相同目标的编译产物, 混用 key 会导致两边来回覆盖
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-ax6s-nikki-${{ env.REPO_BRANCH }}-${{ hashFiles('ax6s-immortalwrt-25.12-nikki.config') }}
+          restore-keys: |
+            ccache-ax6s-nikki-${{ env.REPO_BRANCH }}-
+
+      # dl 目录纯累加来源码包, 两版共用即可, 但为避免相互挤出仍然分开
+      - name: 恢复已下载的源码包
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-ax6s-nikki-${{ env.REPO_BRANCH }}
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "== 确认 Nikki 相关包已就位 =="
+          ./scripts/feeds list -r nikki || true
+
+      - name: 载入 config 与自定义文件
+        run: |
+          cd openwrt
+          cp "../$CONFIG_FILE" .config
+          if [ -d ../files ]; then cp -r ../files ./files; fi
+          make defconfig
+          ./scripts/diffconfig.sh > ../config-effective.diff
+          cat ../config-effective.diff
+          echo "== 核对: Nikki 三件套必须出现在生效配置里 =="
+          grep -E '^CONFIG_PACKAGE_(nikki|luci-app-nikki|mihomo-meta)=' .config || true
+
+      - name: 上传最终生效配置(便于核对)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax6s-nikki-effective-config
+          path: config-effective.diff
+          if-no-files-found: ignore
+
+      # make download 会在这里把 golang 工具链、MetaCubeX/mihomo 源码、
+      # yq 源码一并抓下来 (mihomo 走 git clone, 体积较大)
+      - name: 下载依赖源码
+        run: cd openwrt && make download -j8
+
+      - name: 编译固件
+        run: |
+          cd openwrt
+          # 与 rules.mk 里的 $(TOPDIR)/.ccache 保持一致
+          export CCACHE_DIR="$GITHUB_WORKSPACE/openwrt/.ccache"
+          ccache -M 5G
+          echo "== ccache 初始状态 (首跑为空属于正常) =="
+          ccache -s | head -6
+          echo "== 开始编译 $(date) =="
+          set -o pipefail
+          make -j$(nproc) V=s 2>&1 | tee ../build.log
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "== 并行编译失败, 单线程重试 $(date) =="
+            make -j1 V=s 2>&1 | tee -a ../build.log
+          fi
+          ccache -s
+
+      - name: 整理产物
+        run: |
+          cd openwrt/bin/targets/$TARGET_DIR
+          echo "== 产物列表 =="
+          ls -lh
+          mkdir -p ../../../../dist
+          cp -f *"$DEVICE_NAME"*.itb  ../../../../dist/ 2>/dev/null || true
+          cp -f *"$DEVICE_NAME"*.bin  ../../../../dist/ 2>/dev/null || true
+          cp -f *"$DEVICE_NAME"*.manifest ../../../../dist/ 2>/dev/null || true
+          cp -f sha256sums ../../../../dist/ 2>/dev/null || true
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-${{ env.REPO_BRANCH }}-ax6s-nikki-${{ env.BUILD_DATE }}-${{ env.SRC_COMMIT }}
+          path: openwrt/dist/
+          if-no-files-found: error
+
+      - name: 失败时上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-nikki
+          path: build.log
+          if-no-files-found: ignore
+
+      # 清理历史运行记录: 失败/取消/超时一律删除且不占用保留名额, 成功只留最近 KEEP_SUCCESS 次
+      # 注意: 删除运行记录会连带删掉那次的日志和 Artifact(固件),
+      #       所以 KEEP_SUCCESS 实际上就是你能保留的固件份数
+      # 加了 workflow_id=$WF_FILE 限定: 只扫描本 workflow 的运行记录,
+      # 否则会和 build-ax6s.yml (OpenClash 版) 互相删除对方的成品
+      - name: 清理历史运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          api="https://api.github.com/repos/$REPO/actions/runs"
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp"' EXIT
+
+          for p in 1 2 3 4 5; do
+            resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                        -H "Accept: application/vnd.github+json" \
+                        "$api?workflow_id=$WF_FILE&per_page=100&page=$p")
+            cnt=$(printf '%s' "$resp" | jq -r '.workflow_runs | length // 0')
+            [ "$cnt" -eq 0 ] && break
+            # API 默认按创建时间倒序返回
+            printf '%s' "$resp" \
+              | jq -r '.workflow_runs[] | "\(.id)\t\(.conclusion // "pending")\t\(.status)"' \
+              >> "$tmp"
+          done
+
+          echo "扫描到 $WF_FILE 运行记录: $(wc -l < "$tmp" | tr -d ' ') 条"
+
+          # 先锁定保留名单: 最近 N 条成功的
+          keep=$(awk -F'\t' '$2=="success"{print $1}' "$tmp" | head -n "$KEEP_SUCCESS")
+          echo "保留名单(最近 $KEEP_SUCCESS 次成功): ${keep:-无}"
+
+          deleted=0
+          failed=0
+          while IFS=$'\t' read -r id conclusion status; do
+            # 正在跑的不动 (本次运行自己也在这里被跳过)
+            if [ "$status" != "completed" ]; then continue; fi
+            if [ "$id" = "$GITHUB_RUN_ID" ]; then continue; fi
+            if [ "$conclusion" = "success" ] && printf '%s\n' "$keep" | grep -qx "$id"; then
+              continue
+            fi
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+                    -H "Authorization: Bearer $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "$api/$id")
+            if [ "$code" = "204" ]; then
+              echo "  已删除 $id ($conclusion)"
+              deleted=$((deleted + 1))
+            else
+              echo "  删除失败 $id ($conclusion) HTTP $code"
+              failed=$((failed + 1))
+            fi
+          done < "$tmp"
+
+          echo "清理完成: 删除 $deleted 条, 失败 $failed 条"
+          if [ "$failed" -gt 0 ] && [ "$deleted" -eq 0 ]; then
+            echo "::warning::一条都没删掉, 多半是 GITHUB_TOKEN 权限不足, 请把 Workflow permissions 改为 Read and write"
+          fi
